@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """
-Polymarket BTC 15-Minute Up/Down — Full Orderbook Tick Collector
-Captures every single bid/ask change via WebSocket for backtesting.
+Polymarket BTC Orderbook Collector — ALL market types.
+
+Collects tick-level orderbook data from ALL active BTC binary markets:
+  - Daily Up/Down     (bitcoin-up-or-down-on-march-XX)      ~$300K/day
+  - Above strikes     (bitcoin-above-on-march-XX)            ~$2.5M/day
+  - Price targets     (what-price-will-bitcoin-hit-on-XX)    ~$350K/day
+  - 5-minute slots    (btc-updown-5m-*)                      ~$260K/day
+  - 15-minute slots   (btc-updown-15m-*)
+  - Weekly/monthly    (btc-multi-strikes-weekly, etc.)
 
 Usage:
-    python collector.py               # Start collecting
-    python collector.py --export      # Export DB to CSV files
-    python collector.py --export --output ./data/
+    python collector.py                # Start collecting
+    python collector.py --export       # Export DB to CSV
 """
 
 import asyncio
@@ -34,12 +40,15 @@ WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 GAMMA_URL = "https://gamma-api.polymarket.com/events"
 CLOB_URL = "https://clob.polymarket.com"
 
-# How often (seconds) to check if a new 15m market started
-MARKET_CHECK_INTERVAL = 60
-
-# DB write batch: commit after this many rows or this many seconds
-BATCH_SIZE = 100
+MARKET_CHECK_INTERVAL = 30     # check for new markets every 30s
+MAX_CONCURRENT_STREAMS = 50    # max WS connections
+BATCH_SIZE = 200
 BATCH_TIMEOUT = 2.0
+
+# Slug patterns to match — only BTC 15-minute Up/Down markets
+BTC_PATTERNS = [
+    ("slug", "btc-updown-15m"),
+]
 
 
 # ─────────────────────────────────────────────
@@ -56,62 +65,68 @@ logger = logging.getLogger("collector")
 
 
 # ─────────────────────────────────────────────
-# Database
+# Database — generalized for multi-outcome markets
 # ─────────────────────────────────────────────
 def init_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")   # allows concurrent reads during writes
-    conn.execute("PRAGMA synchronous=NORMAL") # faster writes, safe with WAL
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript("""
-        CREATE TABLE IF NOT EXISTS markets (
+        CREATE TABLE IF NOT EXISTS events (
             id             INTEGER PRIMARY KEY AUTOINCREMENT,
-            market_start_ts INTEGER NOT NULL,
-            market_end_ts   INTEGER NOT NULL,
-            condition_id    TEXT NOT NULL UNIQUE,
-            up_token_id     TEXT NOT NULL,
-            down_token_id   TEXT NOT NULL,
-            resolved        TEXT,
-            discovered_at   INTEGER NOT NULL
+            slug           TEXT NOT NULL,
+            title          TEXT,
+            event_type     TEXT NOT NULL,
+            end_ts         INTEGER NOT NULL,
+            discovered_at  INTEGER NOT NULL,
+            UNIQUE(slug)
         );
 
-        CREATE TABLE IF NOT EXISTS orderbook_events (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            market_id     INTEGER NOT NULL REFERENCES markets(id),
-            event_ts      INTEGER NOT NULL,
-            received_ts   INTEGER NOT NULL,
-            token_side    TEXT NOT NULL,
-            event_type    TEXT NOT NULL,
-            price         REAL,
-            size          REAL,
-            side          TEXT,
-            best_bid      REAL,
-            best_ask      REAL,
+        CREATE TABLE IF NOT EXISTS tokens (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id       INTEGER NOT NULL REFERENCES events(id),
+            condition_id   TEXT NOT NULL,
+            token_id       TEXT NOT NULL UNIQUE,
+            outcome        TEXT NOT NULL,
+            question       TEXT,
+            resolved       TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS orderbook_ticks (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_id       INTEGER NOT NULL REFERENCES tokens(id),
+            event_ts       INTEGER NOT NULL,
+            received_ts    INTEGER NOT NULL,
+            tick_type      TEXT NOT NULL,
+            price          REAL,
+            size           REAL,
+            side           TEXT,
+            best_bid       REAL,
+            best_ask       REAL,
             full_book_json TEXT
         );
 
-        CREATE INDEX IF NOT EXISTS idx_events_market ON orderbook_events(market_id);
-        CREATE INDEX IF NOT EXISTS idx_events_ts     ON orderbook_events(event_ts);
-        CREATE INDEX IF NOT EXISTS idx_events_side   ON orderbook_events(token_side);
+        CREATE INDEX IF NOT EXISTS idx_ticks_token ON orderbook_ticks(token_id);
+        CREATE INDEX IF NOT EXISTS idx_ticks_ts    ON orderbook_ticks(event_ts);
+        CREATE INDEX IF NOT EXISTS idx_ticks_type  ON orderbook_ticks(tick_type);
     """)
     conn.commit()
     return conn
 
 
 # ─────────────────────────────────────────────
-# In-memory L2 orderbook state
+# In-memory L2 orderbook
 # ─────────────────────────────────────────────
 class OrderbookState:
     def __init__(self):
-        self.bids: dict[str, float] = {}   # price_str → size
+        self.bids: dict[str, float] = {}
         self.asks: dict[str, float] = {}
 
     def apply_book(self, bids: list, asks: list):
-        """Full snapshot — replace entire book."""
         self.bids = {b["price"]: float(b["size"]) for b in bids}
         self.asks = {a["price"]: float(a["size"]) for a in asks}
 
     def apply_price_change(self, side: str, price: str, size: float):
-        """Delta update — update or remove one price level."""
         book = self.bids if side == "BUY" else self.asks
         if size == 0:
             book.pop(price, None)
@@ -119,43 +134,54 @@ class OrderbookState:
             book[price] = size
 
     def best_bid(self) -> Optional[float]:
-        if not self.bids:
-            return None
-        return max(float(p) for p in self.bids)
+        return max(float(p) for p in self.bids) if self.bids else None
 
     def best_ask(self) -> Optional[float]:
-        if not self.asks:
-            return None
-        return min(float(p) for p in self.asks)
+        return min(float(p) for p in self.asks) if self.asks else None
 
     def to_json(self) -> str:
-        bids = sorted(
-            [{"price": p, "size": s} for p, s in self.bids.items()],
-            key=lambda x: float(x["price"]), reverse=True
-        )
-        asks = sorted(
-            [{"price": p, "size": s} for p, s in self.asks.items()],
-            key=lambda x: float(x["price"])
-        )
+        bids = sorted([{"price": p, "size": s} for p, s in self.bids.items()],
+                       key=lambda x: float(x["price"]), reverse=True)
+        asks = sorted([{"price": p, "size": s} for p, s in self.asks.items()],
+                       key=lambda x: float(x["price"]))
         return json.dumps({"bids": bids, "asks": asks})
 
 
 # ─────────────────────────────────────────────
-# Market Discovery
+# Market Discovery — finds ALL BTC markets
 # ─────────────────────────────────────────────
+def _matches_btc(event: dict) -> bool:
+    slug = event.get("slug", "").lower()
+    for field, pattern in BTC_PATTERNS:
+        val = event.get(field, "").lower()
+        if pattern in val:
+            return True
+    return False
+
+
+def _parse_json_field(val):
+    if isinstance(val, str):
+        try:
+            return json.loads(val)
+        except (json.JSONDecodeError, TypeError):
+            return val
+    return val
+
+
 class MarketDiscovery:
     def __init__(self, session: aiohttp.ClientSession):
         self.session = session
 
-    async def get_current_btc_15m_market(self) -> Optional[dict]:
-        """
-        Query Gamma API for the active BTC 15-minute Up/Down market.
-        Returns dict with condition_id, up_token_id, down_token_id, start_ts, end_ts.
-        """
+    async def discover_btc_markets(self) -> list[dict]:
+        """Return list of {slug, title, event_type, end_ts, tokens: [{token_id, outcome, question, condition_id}]}."""
+        now_ts = int(time.time())
+        results = []
+
+        # Fetch active, unclosed events
         params = {
             "active": "true",
             "closed": "false",
-            "limit": "50",
+            "limit": "200",
             "order": "id",
             "ascending": "false",
         }
@@ -165,306 +191,242 @@ class MarketDiscovery:
                 events = await resp.json()
         except Exception as e:
             logger.error(f"Gamma API error: {e}")
-            return None
-
-        now_ts = int(time.time())
+            return []
 
         for event in events:
+            if not _matches_btc(event):
+                continue
+
             slug = event.get("slug", "")
-            # Match pattern: btc-updown-15m-{unix_timestamp}
-            if not ("btc" in slug.lower() and "updown" in slug.lower() and "15m" in slug.lower()):
+            title = event.get("title", "")
+            end_str = event.get("endDate", "")
+
+            end_ts = 0
+            if end_str:
+                try:
+                    end_ts = int(datetime.fromisoformat(end_str.replace("Z", "+00:00")).timestamp())
+                except Exception:
+                    pass
+
+            # Skip markets that ended >5min ago
+            if end_ts and end_ts < now_ts - 300:
                 continue
 
-            markets = event.get("markets", [])
-            if not markets:
-                continue
+            raw_markets = event.get("markets", [])
+            tokens = []
 
-            up_token_id = None
-            down_token_id = None
-            start_ts = None
-            end_ts = None
-            condition_id = None
-
-            for market in markets:
-                question = market.get("question", "").lower()
-                clob_ids = market.get("clobTokenIds", [])
-                if not clob_ids:
+            for mk in raw_markets:
+                if isinstance(mk, str):
+                    try:
+                        mk = json.loads(mk)
+                    except Exception:
+                        continue
+                if not isinstance(mk, dict):
                     continue
 
-                condition_id = market.get("conditionId", "")
-                end_time_str = market.get("endDate") or market.get("endDateIso")
-                start_time_str = market.get("startDate") or market.get("startDateIso")
-
-                # Parse timestamps
-                if end_time_str:
-                    try:
-                        end_ts = int(datetime.fromisoformat(
-                            end_time_str.replace("Z", "+00:00")
-                        ).timestamp())
-                    except Exception:
-                        pass
-
-                if start_time_str:
-                    try:
-                        start_ts = int(datetime.fromisoformat(
-                            start_time_str.replace("Z", "+00:00")
-                        ).timestamp())
-                    except Exception:
-                        pass
-
-                # Determine Up/Down from outcomes
-                outcomes = market.get("outcomes", [])
-                for i, outcome in enumerate(outcomes):
-                    if isinstance(outcome, str):
-                        if outcome.lower() == "up" and i < len(clob_ids):
-                            up_token_id = clob_ids[i]
-                        elif outcome.lower() == "down" and i < len(clob_ids):
-                            down_token_id = clob_ids[i]
-
-                # Fallback: first token=Up, second token=Down
-                if not up_token_id and len(clob_ids) >= 1:
-                    up_token_id = clob_ids[0]
-                if not down_token_id and len(clob_ids) >= 2:
-                    down_token_id = clob_ids[1]
-
-            if up_token_id and down_token_id and end_ts:
-                # Skip if market already ended
-                if end_ts < now_ts - 60:
+                clob_ids = _parse_json_field(mk.get("clobTokenIds", []))
+                outcomes = _parse_json_field(mk.get("outcomes", []))
+                if not isinstance(clob_ids, list) or not clob_ids:
                     continue
-                if start_ts is None:
-                    start_ts = end_ts - 15 * 60
+                if not isinstance(outcomes, list):
+                    outcomes = []
 
-                logger.info(
-                    f"Discovered market: {slug} | end={datetime.fromtimestamp(end_ts, tz=timezone.utc).isoformat()}"
-                )
-                return {
-                    "condition_id": condition_id,
-                    "up_token_id": up_token_id,
-                    "down_token_id": down_token_id,
-                    "market_start_ts": start_ts,
-                    "market_end_ts": end_ts,
-                }
+                condition_id = mk.get("conditionId", "")
+                question = mk.get("question", "")
 
-        logger.warning("No active BTC 15m market found in Gamma API response")
-        return None
+                for i, token_id in enumerate(clob_ids):
+                    outcome = outcomes[i] if i < len(outcomes) else f"outcome_{i}"
+                    tokens.append({
+                        "token_id": token_id,
+                        "outcome": outcome,
+                        "question": question,
+                        "condition_id": condition_id,
+                    })
 
-    def upsert_market(self, conn: sqlite3.Connection, market: dict) -> int:
-        """Insert market if not exists. Return market id."""
-        row = conn.execute(
-            "SELECT id FROM markets WHERE condition_id = ?",
-            (market["condition_id"],)
-        ).fetchone()
+            if tokens:
+                # Classify event type
+                event_type = "other"
+                sl = slug.lower()
+                if "updown-5m" in sl:
+                    event_type = "5m_updown"
+                elif "updown-15m" in sl:
+                    event_type = "15m_updown"
+                elif "up-or-down" in sl:
+                    event_type = "daily_updown"
+                elif "above" in sl:
+                    event_type = "strike_above"
+                elif "price-will" in sl or "price-on" in sl:
+                    event_type = "price_target"
+
+                results.append({
+                    "slug": slug,
+                    "title": title,
+                    "event_type": event_type,
+                    "end_ts": end_ts,
+                    "tokens": tokens,
+                })
+
+        # Sort by end_ts ascending (soonest-expiring first)
+        results.sort(key=lambda x: x["end_ts"])
+        return results
+
+    def upsert_event(self, conn: sqlite3.Connection, event: dict) -> int:
+        """Insert event if not exists, return event_id."""
+        row = conn.execute("SELECT id FROM events WHERE slug = ?", (event["slug"],)).fetchone()
         if row:
             return row[0]
         cur = conn.execute(
-            """INSERT INTO markets
-               (market_start_ts, market_end_ts, condition_id, up_token_id, down_token_id, discovered_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (
-                market["market_start_ts"],
-                market["market_end_ts"],
-                market["condition_id"],
-                market["up_token_id"],
-                market["down_token_id"],
-                int(time.time()),
-            ),
+            "INSERT INTO events (slug, title, event_type, end_ts, discovered_at) VALUES (?,?,?,?,?)",
+            (event["slug"], event["title"], event["event_type"], event["end_ts"], int(time.time()))
         )
         conn.commit()
-        logger.info(f"Inserted new market id={cur.lastrowid} condition={market['condition_id'][:16]}...")
         return cur.lastrowid
 
-    async def resolve_market(self, conn: sqlite3.Connection, market_id: int, condition_id: str):
-        """Check if a past market resolved and update DB."""
-        params = {"conditionIds": condition_id}
+    def upsert_token(self, conn: sqlite3.Connection, event_id: int, token: dict) -> int:
+        """Insert token if not exists, return token_id (our internal DB id)."""
+        row = conn.execute("SELECT id FROM tokens WHERE token_id = ?", (token["token_id"],)).fetchone()
+        if row:
+            return row[0]
+        cur = conn.execute(
+            "INSERT INTO tokens (event_id, condition_id, token_id, outcome, question) VALUES (?,?,?,?,?)",
+            (event_id, token["condition_id"], token["token_id"], token["outcome"], token["question"])
+        )
+        conn.commit()
+        return cur.lastrowid
+
+    async def resolve_tokens(self, conn: sqlite3.Connection, condition_id: str):
+        """Check resolution status for tokens."""
         try:
             async with self.session.get(
                 "https://gamma-api.polymarket.com/markets",
-                params=params,
+                params={"conditionIds": condition_id},
                 timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 resp.raise_for_status()
                 data = await resp.json()
-        except Exception as e:
-            logger.error(f"Resolve check error: {e}")
+        except Exception:
             return
 
         for market in data:
             if not market.get("closed"):
                 continue
             winner_index = market.get("winnerIndex")
-            outcomes = market.get("outcomes", [])
+            outcomes = _parse_json_field(market.get("outcomes", []))
             resolved = None
-            if winner_index is not None and winner_index < len(outcomes):
+            if winner_index is not None and isinstance(outcomes, list) and winner_index < len(outcomes):
                 resolved = outcomes[winner_index].upper()
-            elif market.get("resolution"):
-                resolved = str(market["resolution"]).upper()
-
             if resolved:
-                conn.execute(
-                    "UPDATE markets SET resolved = ? WHERE id = ?",
-                    (resolved, market_id)
-                )
+                cond = market.get("conditionId", condition_id)
+                conn.execute("UPDATE tokens SET resolved = ? WHERE condition_id = ? AND resolved IS NULL",
+                             (resolved, cond))
                 conn.commit()
-                logger.info(f"Market id={market_id} resolved: {resolved}")
-                return
 
 
 # ─────────────────────────────────────────────
-# WebSocket Stream (one per token)
+# WebSocket Stream — one per token
 # ─────────────────────────────────────────────
 class TokenStream:
-    def __init__(self, token_side: str, write_queue: asyncio.Queue):
-        self.token_side = token_side
+    def __init__(self, clob_token_id: str, db_token_id: int, label: str, write_queue: asyncio.Queue):
+        self.clob_token_id = clob_token_id
+        self.db_token_id = db_token_id
+        self.label = label
         self.write_queue = write_queue
-        self.token_id: Optional[str] = None
-        self.market_id: Optional[int] = None
         self.book = OrderbookState()
         self._stop = False
-        self._resubscribe = asyncio.Event()
         self.task: Optional[asyncio.Task] = None
-
-    def set_market(self, token_id: str, market_id: int):
-        """Called by market manager when a new market starts."""
-        self.token_id = token_id
-        self.market_id = market_id
-        self.book = OrderbookState()
-        self._resubscribe.set()
 
     def stop(self):
         self._stop = True
-        self._resubscribe.set()
 
     async def run(self):
         delay = 1
         while not self._stop:
-            if not self.token_id:
-                await asyncio.sleep(1)
-                continue
             try:
                 await self._stream_loop()
-                delay = 1  # reset on clean exit
+                delay = 1
             except Exception as e:
-                logger.warning(f"[{self.token_side}] WS error: {e}, retry in {delay}s")
+                if self._stop:
+                    return
+                logger.warning(f"[{self.label}] WS error: {e}, retry in {delay}s")
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 60)
 
     async def _stream_loop(self):
-        self._resubscribe.clear()
-        token_id = self.token_id
-        market_id = self.market_id
-        log = logging.getLogger(f"stream.{self.token_side}")
+        log = logging.getLogger(f"ws.{self.label[:20]}")
+        log.info(f"Connecting | token={self.clob_token_id[:16]}...")
 
-        log.info(f"Connecting | token={token_id[:16]}...")
-        async with websockets.connect(
-            WS_URL,
-            ping_interval=20,
-            ping_timeout=20,
-            close_timeout=5,
-        ) as ws:
-            # Subscribe
-            await ws.send(json.dumps({
-                "assets_ids": [token_id],
-                "type": "market"
-            }))
+        async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
+            await ws.send(json.dumps({"assets_ids": [self.clob_token_id], "type": "market"}))
             log.info("Subscribed")
 
-            recv_task = asyncio.ensure_future(self._recv_loop(ws, token_id, market_id, log))
-            resub_task = asyncio.ensure_future(self._resubscribe.wait())
-
-            done, pending = await asyncio.wait(
-                [recv_task, resub_task],
-                return_when=asyncio.FIRST_COMPLETED
-            )
-            for t in pending:
-                t.cancel()
-
-            if self._resubscribe.is_set() and not self._stop:
-                log.info("Resubscribing to new market token")
-
-    async def _recv_loop(self, ws, token_id: str, market_id: int, log):
-        async for raw in ws:
-            received_ts = int(time.time() * 1000)
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-
-            # Handle both single dict and list of events
-            events = msg if isinstance(msg, list) else [msg]
-
-            for event in events:
-                etype = event.get("event_type")
-                if not etype:
+            async for raw in ws:
+                if self._stop:
+                    return
+                received_ts = int(time.time() * 1000)
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
                     continue
 
-                event_ts_raw = event.get("timestamp")
-                event_ts = int(event_ts_raw) if event_ts_raw else received_ts
+                events = msg if isinstance(msg, list) else [msg]
+                for event in events:
+                    etype = event.get("event_type")
+                    if not etype:
+                        continue
 
-                if etype == "book":
-                    bids = event.get("bids", [])
-                    asks = event.get("asks", [])
-                    self.book.apply_book(bids, asks)
-                    await self.write_queue.put({
-                        "market_id": market_id,
-                        "event_ts": event_ts,
-                        "received_ts": received_ts,
-                        "token_side": self.token_side,
-                        "event_type": "book",
-                        "price": None,
-                        "size": None,
-                        "side": None,
-                        "best_bid": self.book.best_bid(),
-                        "best_ask": self.book.best_ask(),
-                        "full_book_json": self.book.to_json(),
-                    })
+                    event_ts_raw = event.get("timestamp")
+                    event_ts = int(event_ts_raw) if event_ts_raw else received_ts
 
-                elif etype == "price_change":
-                    for change in event.get("changes", []):
-                        side = change.get("side", "")
-                        price_str = change.get("price", "0")
-                        size = float(change.get("size", 0))
-                        self.book.apply_price_change(side, price_str, size)
+                    if etype == "book":
+                        self.book.apply_book(event.get("bids", []), event.get("asks", []))
                         await self.write_queue.put({
-                            "market_id": market_id,
-                            "event_ts": event_ts,
-                            "received_ts": received_ts,
-                            "token_side": self.token_side,
-                            "event_type": "price_change",
-                            "price": float(price_str),
-                            "size": size,
-                            "side": side,
+                            "token_id": self.db_token_id,
+                            "event_ts": event_ts, "received_ts": received_ts,
+                            "tick_type": "book",
+                            "price": None, "size": None, "side": None,
                             "best_bid": self.book.best_bid(),
                             "best_ask": self.book.best_ask(),
-                            "full_book_json": None,  # save space — reconstruct from deltas
+                            "full_book_json": self.book.to_json(),
                         })
 
-                elif etype == "last_trade_price":
-                    await self.write_queue.put({
-                        "market_id": market_id,
-                        "event_ts": event_ts,
-                        "received_ts": received_ts,
-                        "token_side": self.token_side,
-                        "event_type": "trade",
-                        "price": float(event.get("price", 0)),
-                        "size": float(event.get("size", 0)),
-                        "side": None,
-                        "best_bid": self.book.best_bid(),
-                        "best_ask": self.book.best_ask(),
-                        "full_book_json": None,
-                    })
+                    elif etype == "price_change":
+                        for change in event.get("changes", []):
+                            side = change.get("side", "")
+                            price_str = change.get("price", "0")
+                            size = float(change.get("size", 0))
+                            self.book.apply_price_change(side, price_str, size)
+                            await self.write_queue.put({
+                                "token_id": self.db_token_id,
+                                "event_ts": event_ts, "received_ts": received_ts,
+                                "tick_type": "price_change",
+                                "price": float(price_str), "size": size, "side": side,
+                                "best_bid": self.book.best_bid(),
+                                "best_ask": self.book.best_ask(),
+                                "full_book_json": None,
+                            })
+
+                    elif etype == "last_trade_price":
+                        await self.write_queue.put({
+                            "token_id": self.db_token_id,
+                            "event_ts": event_ts, "received_ts": received_ts,
+                            "tick_type": "trade",
+                            "price": float(event.get("price", 0)),
+                            "size": float(event.get("size", 0)),
+                            "side": None,
+                            "best_bid": self.book.best_bid(),
+                            "best_ask": self.book.best_ask(),
+                            "full_book_json": None,
+                        })
 
 
 # ─────────────────────────────────────────────
-# DB Writer (batched inserts)
+# DB Writer (batched)
 # ─────────────────────────────────────────────
 async def db_writer_task(queue: asyncio.Queue, conn: sqlite3.Connection):
     log = logging.getLogger("db_writer")
-    INSERT_SQL = """
-        INSERT INTO orderbook_events
-        (market_id, event_ts, received_ts, token_side, event_type,
-         price, size, side, best_bid, best_ask, full_book_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """
+    SQL = """INSERT INTO orderbook_ticks
+             (token_id, event_ts, received_ts, tick_type, price, size, side, best_bid, best_ask, full_book_json)
+             VALUES (?,?,?,?,?,?,?,?,?,?)"""
     total = 0
     while True:
         batch = []
@@ -476,9 +438,8 @@ async def db_writer_task(queue: asyncio.Queue, conn: sqlite3.Connection):
             try:
                 row = await asyncio.wait_for(queue.get(), timeout=remaining)
                 batch.append((
-                    row["market_id"], row["event_ts"], row["received_ts"],
-                    row["token_side"], row["event_type"],
-                    row["price"], row["size"], row["side"],
+                    row["token_id"], row["event_ts"], row["received_ts"],
+                    row["tick_type"], row["price"], row["size"], row["side"],
                     row["best_bid"], row["best_ask"], row["full_book_json"],
                 ))
                 queue.task_done()
@@ -486,115 +447,125 @@ async def db_writer_task(queue: asyncio.Queue, conn: sqlite3.Connection):
                 break
 
         if batch:
-            conn.executemany(INSERT_SQL, batch)
+            conn.executemany(SQL, batch)
             conn.commit()
             total += len(batch)
-            log.debug(f"Wrote {len(batch)} rows (total={total})")
+            if total % 1000 < len(batch):
+                log.info(f"Total ticks written: {total:,}")
 
 
 # ─────────────────────────────────────────────
-# Market Manager
+# Stream Manager — dynamic, multi-market
 # ─────────────────────────────────────────────
-async def market_manager_task(
+async def stream_manager_task(
     discovery: MarketDiscovery,
     conn: sqlite3.Connection,
-    stream_up: TokenStream,
-    stream_down: TokenStream,
+    write_queue: asyncio.Queue,
 ):
-    log = logging.getLogger("market_mgr")
-    current_market_id: Optional[int] = None
-    current_end_ts: Optional[int] = None
-    prev_market_id: Optional[int] = None
-    prev_condition_id: Optional[str] = None
+    log = logging.getLogger("stream_mgr")
+    active_streams: dict[str, TokenStream] = {}  # clob_token_id → stream
 
     while True:
-        market = await discovery.get_current_btc_15m_market()
+        try:
+            markets = await discovery.discover_btc_markets()
+            log.info(f"Discovered {len(markets)} BTC events with {sum(len(m['tokens']) for m in markets)} tokens")
 
-        if market:
-            market_id = discovery.upsert_market(conn, market)
+            seen_token_ids = set()
 
-            if market_id != current_market_id:
-                log.info(f"New market detected: id={market_id}")
+            for market in markets:
+                event_id = discovery.upsert_event(conn, market)
 
-                # Try to resolve previous market
-                if prev_market_id and prev_condition_id:
-                    asyncio.ensure_future(
-                        discovery.resolve_market(conn, prev_market_id, prev_condition_id)
-                    )
+                for token in market["tokens"]:
+                    clob_id = token["token_id"]
+                    seen_token_ids.add(clob_id)
 
-                prev_market_id = current_market_id
-                prev_condition_id = (
-                    conn.execute("SELECT condition_id FROM markets WHERE id=?", (current_market_id,)).fetchone() or [None]
-                )[0] if current_market_id else None
+                    if clob_id in active_streams:
+                        continue  # already streaming
 
-                current_market_id = market_id
-                current_end_ts = market["market_end_ts"]
+                    if len(active_streams) >= MAX_CONCURRENT_STREAMS:
+                        log.warning(f"Hit max streams ({MAX_CONCURRENT_STREAMS}), skipping new tokens")
+                        break
 
-                # Signal streams to resubscribe
-                stream_up.set_market(market["up_token_id"], market_id)
-                stream_down.set_market(market["down_token_id"], market_id)
+                    db_token_id = discovery.upsert_token(conn, event_id, token)
+                    label = f"{market['event_type']}:{token['outcome'][:10]}"
+                    stream = TokenStream(clob_id, db_token_id, label, write_queue)
+                    stream.task = asyncio.create_task(stream.run(), name=f"ws_{clob_id[:12]}")
+                    active_streams[clob_id] = stream
+                    log.info(f"Started stream: {label} | {market['slug'][:40]}")
+
+            # Stop streams for markets no longer active
+            to_remove = [cid for cid in active_streams if cid not in seen_token_ids]
+            for cid in to_remove:
+                stream = active_streams.pop(cid)
+                stream.stop()
+                if stream.task:
+                    stream.task.cancel()
+                log.info(f"Stopped stream: {stream.label}")
+
+            # Resolve ended tokens
+            ended_events = conn.execute(
+                "SELECT DISTINCT condition_id FROM tokens WHERE resolved IS NULL"
+            ).fetchall()
+            for (cid,) in ended_events:
+                await discovery.resolve_tokens(conn, cid)
+
+        except Exception as e:
+            log.error(f"Stream manager error: {e}", exc_info=True)
 
         await asyncio.sleep(MARKET_CHECK_INTERVAL)
 
 
 # ─────────────────────────────────────────────
-# Export to CSV
+# Export
 # ─────────────────────────────────────────────
 def export_to_csv(db_path: str, output_dir: str):
     os.makedirs(output_dir, exist_ok=True)
     conn = sqlite3.connect(db_path)
 
-    # Export markets
-    markets_path = os.path.join(output_dir, "markets.csv")
-    rows = conn.execute("SELECT * FROM markets ORDER BY market_start_ts").fetchall()
-    cols = [d[0] for d in conn.execute("SELECT * FROM markets LIMIT 0").description]
-    with open(markets_path, "w", newline="") as f:
+    # Events
+    path = os.path.join(output_dir, "events.csv")
+    rows = conn.execute("SELECT * FROM events ORDER BY end_ts").fetchall()
+    cols = [d[0] for d in conn.execute("SELECT * FROM events LIMIT 0").description]
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f); w.writerow(cols); w.writerows(rows)
+    print(f"events.csv         → {len(rows)} rows")
+
+    # Tokens
+    path = os.path.join(output_dir, "tokens.csv")
+    rows = conn.execute("SELECT * FROM tokens ORDER BY event_id, outcome").fetchall()
+    cols = [d[0] for d in conn.execute("SELECT * FROM tokens LIMIT 0").description]
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f); w.writerow(cols); w.writerows(rows)
+    print(f"tokens.csv         → {len(rows)} rows")
+
+    # Ticks (joined)
+    path = os.path.join(output_dir, "ticks.csv")
+    sql = """
+        SELECT
+            t.event_ts, t.received_ts, t.tick_type,
+            t.price, t.size, t.side,
+            t.best_bid, t.best_ask,
+            tk.outcome, tk.question,
+            e.slug, e.event_type, e.end_ts,
+            tk.resolved
+        FROM orderbook_ticks t
+        JOIN tokens tk ON t.token_id = tk.id
+        JOIN events e ON tk.event_id = e.id
+        ORDER BY t.event_ts
+    """
+    rows = conn.execute(sql).fetchall()
+    with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(cols)
+        w.writerow([
+            "event_ts_ms", "received_ts_ms", "tick_type",
+            "price", "size", "side",
+            "best_bid", "best_ask",
+            "outcome", "question",
+            "event_slug", "event_type", "event_end_ts",
+            "resolved"
+        ])
         w.writerows(rows)
-    print(f"Exported {len(rows)} markets → {markets_path}")
-
-    # Export events grouped by month
-    months = conn.execute(
-        """SELECT DISTINCT strftime('%Y-%m', datetime(event_ts/1000, 'unixepoch')) as ym
-           FROM orderbook_events ORDER BY ym"""
-    ).fetchall()
-
-    for (ym,) in months:
-        year, month = ym.split("-")
-        start = int(datetime(int(year), int(month), 1, tzinfo=timezone.utc).timestamp() * 1000)
-        import calendar
-        last_day = calendar.monthrange(int(year), int(month))[1]
-        end = int(datetime(int(year), int(month), last_day, 23, 59, 59, tzinfo=timezone.utc).timestamp() * 1000)
-
-        sql = """
-            SELECT
-                e.event_ts, e.received_ts,
-                m.market_start_ts, m.market_end_ts,
-                e.token_side, e.event_type,
-                e.price, e.size, e.side,
-                e.best_bid, e.best_ask,
-                m.resolved,
-                e.full_book_json
-            FROM orderbook_events e
-            JOIN markets m ON e.market_id = m.id
-            WHERE e.event_ts BETWEEN ? AND ?
-            ORDER BY e.event_ts
-        """
-        rows = conn.execute(sql, (start, end)).fetchall()
-        out_path = os.path.join(output_dir, f"orderbook_events_{ym}.csv")
-        with open(out_path, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow([
-                "event_ts_ms", "received_ts_ms",
-                "market_start_ts", "market_end_ts",
-                "token_side", "event_type",
-                "price", "size", "side",
-                "best_bid", "best_ask",
-                "resolved", "full_book_json"
-            ])
-            w.writerows(rows)
-        print(f"Exported {len(rows)} events → {out_path}")
+    print(f"ticks.csv          → {len(rows):,} rows")
 
     conn.close()
 
@@ -604,13 +575,10 @@ def export_to_csv(db_path: str, output_dir: str):
 # ─────────────────────────────────────────────
 async def run_collector():
     setup_logging()
-    logger.info("Starting Polymarket BTC 15m orderbook collector")
+    logger.info("Starting Polymarket BTC orderbook collector (all market types)")
 
     conn = init_db(DB_PATH)
-    write_queue: asyncio.Queue = asyncio.Queue(maxsize=10000)
-
-    stream_up = TokenStream("UP", write_queue)
-    stream_down = TokenStream("DOWN", write_queue)
+    write_queue: asyncio.Queue = asyncio.Queue(maxsize=50000)
 
     shutdown = asyncio.Event()
 
@@ -626,36 +594,25 @@ async def run_collector():
         discovery = MarketDiscovery(session)
 
         tasks = [
-            asyncio.create_task(stream_up.run(), name="stream_UP"),
-            asyncio.create_task(stream_down.run(), name="stream_DOWN"),
             asyncio.create_task(db_writer_task(write_queue, conn), name="db_writer"),
-            asyncio.create_task(
-                market_manager_task(discovery, conn, stream_up, stream_down),
-                name="market_mgr"
-            ),
+            asyncio.create_task(stream_manager_task(discovery, conn, write_queue), name="stream_mgr"),
         ]
 
         await shutdown.wait()
 
-        logger.info("Stopping streams...")
-        stream_up.stop()
-        stream_down.stop()
+        logger.info("Stopping...")
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Flush remaining queue
-        while not write_queue.empty():
-            await asyncio.sleep(0.1)
 
     conn.close()
     logger.info("Collector stopped cleanly")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Polymarket BTC 15m orderbook collector")
+    parser = argparse.ArgumentParser(description="Polymarket BTC orderbook collector")
     parser.add_argument("--export", action="store_true", help="Export DB to CSV and exit")
-    parser.add_argument("--output", default="./data", help="Output directory for CSV export")
+    parser.add_argument("--output", default="./backtest_data", help="Output directory for CSV export")
     parser.add_argument("--db", default=DB_PATH, help="SQLite DB path")
     args = parser.parse_args()
 
