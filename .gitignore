@@ -5,3 +5,6 @@ __pycache__/
 *.log
 logs/
 .claude/
+data/
+backtest_data/
+btc_15m_snapshots.csv
