@@ -1,180 +1,155 @@
 # Polymarket BTC 15m Orderbook Collector
 
-Captures **every single bid/ask change** on Polymarket's BTC Up/Down 15-minute markets via WebSocket. Stores tick-level orderbook data in SQLite for backtesting.
+24/7 automated collector that captures **1-second orderbook snapshots** from Polymarket's Bitcoin Up/Down 15-minute prediction markets, with live BTC price from Binance.
 
-## What it collects
+## Live Data
 
-For every 15-minute BTC market, both the **Up token** and **Down token**:
+CSV files in [`csv_data/`](csv_data/) are updated **every 15 minutes** automatically.
 
-| Event | What it means |
-|-------|---------------|
-| `book` | Full L2 snapshot (on connect / market start) |
-| `price_change` | One price level changed: price, new size, BUY/SELL side |
-| `trade` | A trade was executed at a price |
+### Output Format — `orderbook_YYYY-MM-DD.csv`
 
-Every row also records `best_bid` and `best_ask` at that moment.
+One row per second, both YES (Up) and NO (Down) tokens merged:
 
----
+| # | Column | Type | Description |
+|---|--------|------|-------------|
+| 1 | `ts_ms` | int | Unix timestamp in milliseconds |
+| 2 | `timestamp` | string | Human readable UTC timestamp |
+| 3 | `window_slug` | string | Market identifier (e.g. `btc-updown-15m-1774155600`) |
+| 4 | `window_end_ts` | int | Window end unix timestamp |
+| 5 | `outcome` | string | Final result (`Up`/`Down`), filled after settlement |
+| 6 | `yes_token_id` | string | YES token CLOB ID |
+| 7 | `no_token_id` | string | NO token CLOB ID |
+| 8 | `yes_bid` | float | Best bid for YES token |
+| 9 | `yes_ask` | float | Best ask for YES token |
+| 10 | `yes_ask_size` | float | Shares available at YES best ask |
+| 11 | `yes_bid_size` | float | Shares available at YES best bid |
+| 12 | `yes_spread` | float | `yes_ask - yes_bid` |
+| 13 | `no_bid` | float | Best bid for NO token |
+| 14 | `no_ask` | float | Best ask for NO token |
+| 15 | `no_ask_size` | float | Shares available at NO best ask |
+| 16 | `no_bid_size` | float | Shares available at NO best bid |
+| 17 | `no_spread` | float | `no_ask - no_bid` |
+| 18 | `yes_mid` | float | `(yes_bid + yes_ask) / 2` |
+| 19 | `no_mid` | float | `(no_bid + no_ask) / 2` |
+| 20 | `yes_imbalance` | float | `yes_bid_size / (yes_bid_size + yes_ask_size)` |
+| 21 | `no_imbalance` | float | `no_bid_size / (no_bid_size + no_ask_size)` |
+| 22 | `btc_price` | float | Current BTC/USDT price from Binance |
 
-## Setup on VM
+### Example
+
+```csv
+ts_ms,timestamp,window_slug,window_end_ts,outcome,yes_token_id,no_token_id,yes_bid,yes_ask,yes_ask_size,yes_bid_size,yes_spread,no_bid,no_ask,no_ask_size,no_bid_size,no_spread,yes_mid,no_mid,yes_imbalance,no_imbalance,btc_price
+1774240513565,2026-03-23T04:35:13.565,btc-updown-15m-1774240200,1774241100,Up,abc123,def456,0.73,0.74,43.81,787.74,0.01,0.26,0.27,747.74,67.0,0.01,0.735,0.265,0.947,0.082,68299.99
+```
+
+### Data Volume
+
+| Period | Windows | Rows | CSV Size |
+|--------|---------|------|----------|
+| 1 day | ~96 | ~86,400 | ~30 MB |
+| 1 month | ~2,900 | ~2.6M | ~900 MB |
+
+## Architecture
+
+```
+polymarket_collector/
+├── __main__.py          # Entry point
+├── config.py            # Settings via env vars (PMC_ prefix)
+├── models.py            # MarketWindow, Token, L2Book, MergedSnapshot
+├── market_manager.py    # Gamma API discovery + lifecycle
+├── book_manager.py      # WebSocket L2 book management
+├── btc_price.py         # Binance BTC/USDT price fetcher
+├── snapshot_scheduler.py # 1-sec merged snapshot loop
+├── storage.py           # CSV writer + Parquet tick buffer
+├── health.py            # Stale stream detection
+└── logging_setup.py     # Structured rotating logs
+```
+
+**Data flow:**
+1. `MarketManager` discovers BTC 15m markets via Polymarket Gamma API
+2. `BookManager` opens WebSocket streams and maintains in-memory L2 orderbooks
+3. `SnapshotScheduler` ticks every 1 second, merges YES/NO books into one row
+4. `BtcPriceFetcher` gets live BTC price from Binance (cached 3s)
+5. `Storage` writes rows to daily CSV files + raw ticks to Parquet
+
+## Setup
 
 ```bash
-# 1. Clone repo
-git clone <repo-url>
+# Clone
+git clone https://github.com/Vinayak19112003/Polymarket-orderbooks.git
 cd Polymarket-orderbooks
 
-# 2. Install dependencies (Python 3.10+)
+# Install
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 
-# 3. Run collector
-python collector.py
+# Run
+python -m polymarket_collector
 ```
 
----
-
-## Run in background (recommended)
+### Run as systemd service (recommended)
 
 ```bash
-nohup python collector.py > /dev/null 2>&1 &
-echo "PID: $!"
-```
-
-To check it's running:
-```bash
-tail -f collector.log
-```
-
-To stop:
-```bash
-kill <PID>
-```
-
----
-
-## Run as systemd service (auto-restart on reboot)
-
-Create `/etc/systemd/system/polymarket-collector.service`:
-
-```ini
+sudo tee /etc/systemd/system/polymarket-collector.service << 'EOF'
 [Unit]
-Description=Polymarket BTC Orderbook Collector
-After=network.target
+Description=Polymarket BTC 15m Orderbook Collector
+After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/user/Polymarket-orderbooks
-ExecStart=/usr/bin/python3 /home/user/Polymarket-orderbooks/collector.py
+User=ubuntu
+WorkingDirectory=/home/ubuntu/Polymarket-orderbooks
+ExecStart=/home/ubuntu/Polymarket-orderbooks/.venv/bin/python -m polymarket_collector
 Restart=always
 RestartSec=10
-StandardOutput=append:/home/user/Polymarket-orderbooks/collector.log
-StandardError=append:/home/user/Polymarket-orderbooks/collector.log
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
-```
+EOF
 
-Enable it:
-```bash
 sudo systemctl daemon-reload
 sudo systemctl enable polymarket-collector
 sudo systemctl start polymarket-collector
-sudo systemctl status polymarket-collector
 ```
 
----
-
-## Check collected data
+### Auto-push to GitHub (every 15 min)
 
 ```bash
-# Count total events
-sqlite3 orderbooks.db "SELECT COUNT(*) FROM orderbook_events;"
-
-# Events per token side
-sqlite3 orderbooks.db "SELECT token_side, COUNT(*) FROM orderbook_events GROUP BY token_side;"
-
-# Markets collected so far
-sqlite3 orderbooks.db "SELECT id, datetime(market_start_ts,'unixepoch'), datetime(market_end_ts,'unixepoch'), resolved FROM markets ORDER BY id DESC LIMIT 10;"
-
-# Events per market
-sqlite3 orderbooks.db "SELECT market_id, token_side, COUNT(*) FROM orderbook_events GROUP BY market_id, token_side ORDER BY market_id DESC LIMIT 20;"
-
-# Latest best bid/ask for Up token
-sqlite3 orderbooks.db "SELECT datetime(event_ts/1000,'unixepoch'), best_bid, best_ask FROM orderbook_events WHERE token_side='UP' ORDER BY id DESC LIMIT 5;"
+crontab -e
+# Add:
+*/15 * * * * /home/ubuntu/Polymarket-orderbooks/daily_push.sh >> /home/ubuntu/Polymarket-orderbooks/logs/push.log 2>&1
 ```
 
----
+## Configuration
 
-## Export to CSV (for backtest)
+All settings can be overridden via environment variables with `PMC_` prefix:
 
-```bash
-# Export all data to ./data/ folder
-python collector.py --export --output ./data/
-```
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PMC_DATA_DIR` | `./data` | Data output directory |
+| `PMC_SLUG_PATTERN` | `btc-updown-15m` | Market slug filter |
+| `PMC_SNAPSHOT_INTERVAL_S` | `1.0` | Snapshot frequency (seconds) |
+| `PMC_DISCOVERY_INTERVAL_S` | `30` | Market discovery polling (seconds) |
+| `PMC_WS_RECONNECT_MAX_S` | `60.0` | Max WebSocket reconnect backoff |
 
-Produces:
-- `data/markets.csv` — one row per 15m market with resolution (UP/DOWN)
-- `data/orderbook_events_YYYY-MM.csv` — all tick events for each month
-
-### CSV columns (orderbook_events)
-
-| Column | Description |
-|--------|-------------|
-| `event_ts_ms` | Event timestamp in milliseconds (from Polymarket) |
-| `received_ts_ms` | Local time your VM received the event |
-| `market_start_ts` | Start of the 15m window (seconds) |
-| `market_end_ts` | End of the 15m window (seconds) |
-| `token_side` | `UP` or `DOWN` |
-| `event_type` | `book`, `price_change`, or `trade` |
-| `price` | Price level that changed (e.g. `0.77` = 77¢) |
-| `size` | New size at this price (`0` = level removed) |
-| `side` | `BUY` (bid) or `SELL` (ask) |
-| `best_bid` | Best bid after this event |
-| `best_ask` | Best ask after this event |
-| `resolved` | `UP`, `DOWN`, or empty (unresolved) |
-| `full_book_json` | Full L2 JSON (only on `book` events) |
-
----
-
-## Load in pandas
+## Load in Python
 
 ```python
 import pandas as pd
 
-# Load one month of events
-df = pd.read_csv("data/orderbook_events_2025-05.csv")
-df["event_dt"] = pd.to_datetime(df["event_ts_ms"], unit="ms", utc=True)
+df = pd.read_csv("csv_data/orderbook_2026-03-23.csv")
 
-# Filter only Up token price changes
-up_changes = df[(df["token_side"] == "UP") & (df["event_type"] == "price_change")]
+# Filter one window
+window = df[df["window_slug"] == "btc-updown-15m-1774240200"]
 
-# Get best bid/ask over time for Up token
-up_quotes = df[df["token_side"] == "UP"][["event_dt", "best_bid", "best_ask"]].dropna()
+# Yes price over time
+window.plot(x="timestamp", y=["yes_bid", "yes_ask"], title="YES Token Price")
 
-# Load markets
-markets = pd.read_csv("data/markets.csv")
-markets["start_dt"] = pd.to_datetime(markets["market_start_ts"], unit="s", utc=True)
-markets["end_dt"]   = pd.to_datetime(markets["market_end_ts"], unit="s", utc=True)
-```
+# Imbalance signal
+window.plot(x="timestamp", y=["yes_imbalance", "no_imbalance"], title="Order Imbalance")
 
----
-
-## Data volume estimate
-
-| Period | Markets | Events (approx) | DB size |
-|--------|---------|-----------------|---------|
-| 1 day  | ~96     | 100k – 500k     | ~30 MB  |
-| 1 month| ~2,900  | 3M – 15M        | ~1 GB   |
-| 3 months| ~8,600 | 10M – 45M       | ~3 GB   |
-
----
-
-## Sanity checks
-
-```python
-# Polymarket invariant: Up price + Down price ≈ 1.0
-# Merge Up and Down best_bid at same timestamp and verify
-up = df[df["token_side"]=="UP"][["event_ts_ms","best_bid"]].rename(columns={"best_bid":"up_bid"})
-dn = df[df["token_side"]=="DOWN"][["event_ts_ms","best_bid"]].rename(columns={"best_bid":"dn_bid"})
-merged = pd.merge_asof(up.sort_values("event_ts_ms"), dn.sort_values("event_ts_ms"), on="event_ts_ms")
-print((merged["up_bid"] + merged["dn_bid"]).describe())  # should be ~1.0
+# BTC price vs prediction
+window.plot(x="timestamp", y="btc_price", secondary_y="yes_mid", title="BTC vs Market")
 ```
