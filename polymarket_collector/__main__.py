@@ -12,6 +12,7 @@ from .storage import Storage
 from .market_manager import MarketManager
 from .book_manager import BookManager
 from .snapshot_scheduler import SnapshotScheduler
+from .btc_price import BtcPriceFetcher
 from .health import HealthMonitor
 
 logger = logging.getLogger("collector.main")
@@ -36,8 +37,9 @@ class Collector:
 
         market_mgr = MarketManager(self.config, self._session)
         book_mgr = BookManager(self.config, self._session, self.storage.write_tick)
+        btc_fetcher = BtcPriceFetcher(self._session)
         snap_sched = SnapshotScheduler(
-            self.config, book_mgr, market_mgr, self.storage.write_snapshot
+            self.config, book_mgr, market_mgr, btc_fetcher, self.storage.write_snapshot
         )
         health = HealthMonitor(self.config, book_mgr, market_mgr, self.storage)
 
@@ -60,16 +62,13 @@ class Collector:
             snap_sched.stop()
             health.stop()
 
-            # Stop all streams
             for cid in list(book_mgr.get_all_active_states().keys()):
                 await book_mgr.stop_token(cid)
 
-            # Cancel background tasks
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Flush remaining data
             self.storage.flush_all()
 
             if self._session:
@@ -82,17 +81,14 @@ class Collector:
 
         while not self._shutdown.is_set():
             try:
-                # Discover new markets
                 new_windows, new_tokens = await market_mgr.discover()
                 for tok in new_tokens:
                     await book_mgr.start_token(tok)
 
-                # Clean up expired
                 expired = market_mgr.get_expired_token_ids()
                 for cid in expired:
                     await book_mgr.stop_token(cid)
 
-                # Check resolutions
                 await market_mgr.check_resolutions()
 
             except asyncio.CancelledError:
@@ -102,9 +98,9 @@ class Collector:
 
             try:
                 await asyncio.wait_for(self._shutdown.wait(), timeout=interval)
-                return  # shutdown signaled
+                return
             except asyncio.TimeoutError:
-                pass  # normal: loop continues
+                pass
 
 
 def main():

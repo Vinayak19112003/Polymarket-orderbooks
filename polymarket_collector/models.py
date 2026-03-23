@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from bisect import insort_left
 from typing import Optional
 
 
@@ -18,7 +17,7 @@ class MarketWindow:
 @dataclass
 class Token:
     clob_token_id: str
-    outcome: str  # "Up" or "Down"
+    outcome: str  # "Yes" (Up) or "No" (Down)
     question: str
     condition_id: str
     window_slug: str
@@ -70,7 +69,6 @@ class L2Book:
         if size > 0:
             new_lvl = L2Level(price, size)
             if reverse:
-                # Bids: descending. Insert to maintain order.
                 idx = 0
                 for i, lvl in enumerate(book):
                     if price > lvl.price:
@@ -79,7 +77,6 @@ class L2Book:
                     idx = i + 1
                 book.insert(idx, new_lvl)
             else:
-                # Asks: ascending.
                 idx = 0
                 for i, lvl in enumerate(book):
                     if price < lvl.price:
@@ -96,6 +93,14 @@ class L2Book:
     @property
     def best_ask(self) -> Optional[float]:
         return self.asks[0].price if self.asks else None
+
+    @property
+    def best_bid_size(self) -> Optional[float]:
+        return self.bids[0].size if self.bids else None
+
+    @property
+    def best_ask_size(self) -> Optional[float]:
+        return self.asks[0].size if self.asks else None
 
     @property
     def mid(self) -> Optional[float]:
@@ -119,33 +124,34 @@ class L2Book:
         tb = self.total_bid_size(depth)
         ta = self.total_ask_size(depth)
         total = tb + ta
-        return round((tb - ta) / total, 6) if total > 0 else None
+        return round(tb / total, 6) if total > 0 else None
 
 
 @dataclass
-class Snapshot:
+class MergedSnapshot:
+    """One row per second with both YES and NO tokens merged."""
     ts_ms: int
+    timestamp: str
     window_slug: str
     window_end_ts: int
-    outcome: str
-    clob_token_id: str
-    best_bid: Optional[float]
-    best_ask: Optional[float]
-    mid: Optional[float]
-    spread: Optional[float]
-    bid_prices: list[float]
-    bid_sizes: list[float]
-    ask_prices: list[float]
-    ask_sizes: list[float]
-    total_bid_size: float
-    total_ask_size: float
-    bid_levels: int
-    ask_levels: int
-    imbalance_5: Optional[float]
-    n_price_changes: int
-    n_trades: int
-    last_trade_price: Optional[float]
-    last_trade_size: Optional[float]
+    outcome: str  # filled after settlement
+    yes_token_id: str
+    no_token_id: str
+    yes_bid: Optional[float]
+    yes_ask: Optional[float]
+    yes_ask_size: Optional[float]
+    yes_bid_size: Optional[float]
+    yes_spread: Optional[float]
+    no_bid: Optional[float]
+    no_ask: Optional[float]
+    no_ask_size: Optional[float]
+    no_bid_size: Optional[float]
+    no_spread: Optional[float]
+    yes_mid: Optional[float]
+    no_mid: Optional[float]
+    yes_imbalance: Optional[float]
+    no_imbalance: Optional[float]
+    btc_price: Optional[float]
 
 
 @dataclass

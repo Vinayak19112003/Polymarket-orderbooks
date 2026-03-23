@@ -1,10 +1,11 @@
 #!/bin/bash
 cd /home/ubuntu/Polymarket-orderbooks
 
-# Export all parquet data into daily CSVs
+# Copy today's orderbook CSV
 /home/ubuntu/Polymarket-orderbooks/.venv/bin/python export_csv.py
 
-# Stage CSVs and scripts
-git add csv_data/ polymarket_collector/ export_csv.py export_backtest.py collector.py requirements.txt .gitignore daily_push.sh
-git commit -m "Daily data update $(date -u +%Y-%m-%d)"
+# Stage and push
+git add csv_data/ polymarket_collector/ export_csv.py daily_push.sh .gitignore
+git diff --cached --quiet && exit 0  # nothing to commit
+git commit -m "Data update $(date -u +'%Y-%m-%d %H:%M') UTC"
 git push origin HEAD:main

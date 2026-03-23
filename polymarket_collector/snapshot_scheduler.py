@@ -1,14 +1,16 @@
-"""1-second snapshot loop synchronized to wall clock."""
+"""1-second snapshot loop — merges YES/NO into one row per window."""
 
 import asyncio
 import time
 import logging
+from datetime import datetime, timezone
 from typing import Callable, Awaitable
 
 from .config import CollectorConfig
-from .models import Snapshot
+from .models import MergedSnapshot
 from .book_manager import BookManager
 from .market_manager import MarketManager
+from .btc_price import BtcPriceFetcher
 
 logger = logging.getLogger("collector.snapshots")
 
@@ -19,11 +21,13 @@ class SnapshotScheduler:
         config: CollectorConfig,
         book_manager: BookManager,
         market_manager: MarketManager,
-        on_snapshot: Callable[[Snapshot], Awaitable[None]],
+        btc_fetcher: BtcPriceFetcher,
+        on_snapshot: Callable[[MergedSnapshot], Awaitable[None]],
     ):
         self._config = config
         self._book_mgr = book_manager
         self._mkt_mgr = market_manager
+        self._btc = btc_fetcher
         self._on_snapshot = on_snapshot
         self._running = False
 
@@ -37,11 +41,11 @@ class SnapshotScheduler:
             ts_ms = int(t0 * 1000)
 
             try:
+                await self._btc.update()
                 await self._tick(ts_ms)
             except Exception as e:
                 logger.error(f"Snapshot tick error: {e}", exc_info=True)
 
-            # Sleep until next aligned tick
             elapsed = time.time() - t0
             sleep_for = max(0, interval - elapsed)
             await asyncio.sleep(sleep_for)
@@ -50,50 +54,77 @@ class SnapshotScheduler:
         self._running = False
 
     async def _tick(self, ts_ms: int):
-        depth = self._config.snapshot_book_depth
         now_s = ts_ms // 1000
         states = self._book_mgr.get_all_active_states()
 
+        # Group states by window_slug
+        by_window: dict[str, dict[str, object]] = {}
         for cid, state in states.items():
-            if not state.book.bids and not state.book.asks:
-                continue
-
-            window = self._mkt_mgr.get_window(state.token.window_slug)
+            slug = state.token.window_slug
+            window = self._mkt_mgr.get_window(slug)
             if not window:
                 continue
-
-            # Only snapshot windows in their live trading period
+            # Only live windows
             if now_s < window.start_ts or now_s > window.end_ts:
                 continue
+            if slug not in by_window:
+                by_window[slug] = {"window": window, "tokens": {}}
+            outcome = state.token.outcome
+            by_window[slug]["tokens"][outcome] = (cid, state)
 
-            book = state.book
-            counters = state.reset_tick_counters()
+        timestamp = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S.%f"
+        )[:-3]
 
-            bid_levels = book.bids[:depth]
-            ask_levels = book.asks[:depth]
+        btc_price = self._btc.price
 
-            snap = Snapshot(
+        for slug, info in by_window.items():
+            window = info["window"]
+            tokens = info["tokens"]
+
+            # Get YES (Up) and NO (Down) states
+            yes_cid, yes_state = tokens.get("Up", (None, None))
+            no_cid, no_state = tokens.get("Down", (None, None))
+
+            if not yes_state and not no_state:
+                continue
+
+            yes_book = yes_state.book if yes_state else None
+            no_book = no_state.book if no_state else None
+
+            # Build imbalance: bid_size / (bid_size + ask_size)
+            def calc_imbalance(book):
+                if not book:
+                    return None
+                bs = book.best_bid_size
+                as_ = book.best_ask_size
+                if bs is None or as_ is None:
+                    return None
+                total = bs + as_
+                return round(bs / total, 6) if total > 0 else None
+
+            snap = MergedSnapshot(
                 ts_ms=ts_ms,
-                window_slug=state.token.window_slug,
+                timestamp=timestamp,
+                window_slug=slug,
                 window_end_ts=window.end_ts,
-                outcome=state.token.outcome,
-                clob_token_id=cid,
-                best_bid=book.best_bid,
-                best_ask=book.best_ask,
-                mid=book.mid,
-                spread=book.spread,
-                bid_prices=[l.price for l in bid_levels],
-                bid_sizes=[l.size for l in bid_levels],
-                ask_prices=[l.price for l in ask_levels],
-                ask_sizes=[l.size for l in ask_levels],
-                total_bid_size=book.total_bid_size(depth),
-                total_ask_size=book.total_ask_size(depth),
-                bid_levels=len(book.bids),
-                ask_levels=len(book.asks),
-                imbalance_5=book.imbalance(5),
-                n_price_changes=counters.get("price_change", 0),
-                n_trades=counters.get("trade", 0),
-                last_trade_price=state.last_trade_price,
-                last_trade_size=state.last_trade_size,
+                outcome="",  # filled after settlement
+                yes_token_id=yes_cid or "",
+                no_token_id=no_cid or "",
+                yes_bid=yes_book.best_bid if yes_book else None,
+                yes_ask=yes_book.best_ask if yes_book else None,
+                yes_ask_size=yes_book.best_ask_size if yes_book else None,
+                yes_bid_size=yes_book.best_bid_size if yes_book else None,
+                yes_spread=yes_book.spread if yes_book else None,
+                no_bid=no_book.best_bid if no_book else None,
+                no_ask=no_book.best_ask if no_book else None,
+                no_ask_size=no_book.best_ask_size if no_book else None,
+                no_bid_size=no_book.best_bid_size if no_book else None,
+                no_spread=no_book.spread if no_book else None,
+                yes_mid=yes_book.mid if yes_book else None,
+                no_mid=no_book.mid if no_book else None,
+                yes_imbalance=calc_imbalance(yes_book),
+                no_imbalance=calc_imbalance(no_book),
+                btc_price=btc_price,
             )
             await self._on_snapshot(snap)
