@@ -1,4 +1,4 @@
-"""Health monitoring: stale stream detection, periodic stats logging."""
+"""Health monitoring: stale stream detection + auto re-seed."""
 
 import asyncio
 import time
@@ -34,29 +34,44 @@ class HealthMonitor:
         while self._running:
             await asyncio.sleep(interval)
             try:
-                self._check()
+                await self._check()
             except Exception as e:
                 logger.error(f"Health check error: {e}", exc_info=True)
 
     def stop(self):
         self._running = False
 
-    def _check(self):
+    async def _check(self):
         now_ms = int(time.time() * 1000)
+        now_s = now_ms // 1000
         timeout_ms = self._config.stale_stream_timeout_s * 1000
         states = self._book_mgr.get_all_active_states()
         storage_stats = self._storage.stats
 
         n_connected = sum(1 for s in states.values() if s.ws_connected)
         n_stale = 0
+        reseed_tasks = []
 
         for cid, state in states.items():
             if state.last_message_ts > 0 and (now_ms - state.last_message_ts) > timeout_ms:
                 n_stale += 1
-                logger.warning(
-                    f"Stale stream: {state.token.outcome}:{state.token.window_slug[:25]} "
-                    f"(last msg {(now_ms - state.last_message_ts) / 1000:.0f}s ago)"
-                )
+
+                # Only re-seed if the window is currently live or starting soon
+                window = self._mkt_mgr.get_window(state.token.window_slug)
+                if window and window.start_ts - 60 <= now_s <= window.end_ts:
+                    reseed_tasks.append(cid)
+
+        # Re-seed stale streams that are in live windows
+        reseeded = 0
+        for cid in reseed_tasks[:20]:  # max 20 per health check
+            try:
+                await self._book_mgr.reseed_from_rest(cid)
+                reseeded += 1
+            except Exception as e:
+                logger.warning(f"Reseed failed for {cid[:16]}: {e}")
+
+        if reseeded:
+            logger.info(f"Re-seeded {reseeded} stale streams from REST")
 
         logger.info(
             f"Health: streams={len(states)} connected={n_connected} stale={n_stale} | "

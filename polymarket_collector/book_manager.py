@@ -97,6 +97,12 @@ class BookManager:
     def get_all_active_states(self) -> dict[str, TokenStreamState]:
         return dict(self._states)
 
+    async def reseed_from_rest(self, clob_token_id: str):
+        """Force re-seed a token's book from REST. Called by health monitor."""
+        state = self._states.get(clob_token_id)
+        if state:
+            await self._seed_from_rest(state)
+
     async def _run_stream(self, clob_token_id: str):
         delay = self._config.ws_reconnect_base_s
         state = self._states.get(clob_token_id)
@@ -104,25 +110,25 @@ class BookManager:
             return
 
         while clob_token_id in self._states:
-            async with self._semaphore:
-                try:
-                    # Seed from REST first
+            try:
+                # Seed from REST first (with semaphore for rate limiting)
+                async with self._semaphore:
                     await self._seed_from_rest(state)
-                    # Then run WS loop
-                    await self._ws_loop(state)
-                    delay = self._config.ws_reconnect_base_s
-                except asyncio.CancelledError:
+                # WS loop runs without holding semaphore
+                await self._ws_loop(state)
+                delay = self._config.ws_reconnect_base_s
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                state.ws_connected = False
+                if clob_token_id not in self._states:
                     return
-                except Exception as e:
-                    state.ws_connected = False
-                    if clob_token_id not in self._states:
-                        return
-                    logger.warning(
-                        f"[{state.token.outcome}:{state.token.window_slug[:25]}] "
-                        f"WS error: {e}, retry in {delay:.1f}s"
-                    )
-                    await asyncio.sleep(delay)
-                    delay = min(delay * 2, self._config.ws_reconnect_max_s)
+                logger.warning(
+                    f"[{state.token.outcome}:{state.token.window_slug[:25]}] "
+                    f"WS error: {e}, retry in {delay:.1f}s"
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, self._config.ws_reconnect_max_s)
 
     async def _seed_from_rest(self, state: TokenStreamState):
         url = f"{self._config.clob_url}/book"
