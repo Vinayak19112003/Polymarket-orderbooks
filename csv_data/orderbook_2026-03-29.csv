@@ -1,0 +1,2 @@
+ts_ms,timestamp,window_slug,window_end_ts,outcome,yes_token_id,no_token_id,yes_bid,yes_ask,yes_ask_size,yes_bid_size,yes_spread,no_bid,no_ask,no_ask_size,no_bid_size,no_spread,yes_mid,no_mid,yes_imbalance,no_imbalance,btc_price
+1774742400783,2026-03-29T00:00:00.783,btc-updown-15m-1774741500,1774742400,Down,100150902157765810124522271690413425743169670317512167757716927599355051117876,38303105248051178122690969272412584538794432705022486421111143365277949045272,,0.01,39699.26,,,0.99,,,39699.26,,,,,,66377.03
